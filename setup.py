@@ -2,7 +2,7 @@
 # -*- encoding: utf-8 -*-
 from setuptools import setup, find_packages
 
-version = '0.5.0'
+version = '0.6.1'
 
 if __name__ == '__main__':
     setup(
@@ -27,5 +27,6 @@ if __name__ == '__main__':
         packages=find_packages(exclude=['tests']),
         include_package_data=True,
         zip_safe=False,
-        install_requires=['vobject', 'lxml', 'nose', 'coverage', 'requests', 'six'],
+        install_requires=['vobject', 'lxml', 'requests', 'six', 'tzlocal', 'pytz'],
+        tests_requires=['nose', 'coverage']
     )

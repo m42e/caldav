@@ -33,12 +33,6 @@ log = logging.getLogger("caldav")
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-class NullHandler(logging.Handler):
-    def emit(self, record):
-        logging.debug(record)
-
-log.addHandler(NullHandler())
-
 ev1 = """BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Example Corp.//CalDAV Client//EN
@@ -126,7 +120,6 @@ SUMMARY:1996 Income Tax Preparation
 CLASS:CONFIDENTIAL
 CATEGORIES:FAMILY,FINANCE
 PRIORITY:1
-STATUS:NEEDS-ACTION
 END:VTODO
 END:VCALENDAR"""
 
@@ -266,11 +259,19 @@ class RepeatedFunctionalTestsBaseClass(object):
         chs = self.principal.get_properties([cdav.CalendarHomeSet()])
         assert '{urn:ietf:params:xml:ns:caldav}calendar-home-set' in chs
 
-    def testGetCalendars(self):
+    def testGetDefaultCalendar(self):
+        if 'nodefaultcalendar' in self.server_params:
+            raise SkipTest("Skipping GetDefaultCalendar, caldav server has no default calendar for the user?")
+        assert_not_equal(len(self.principal.calendars()), 0)
+        
+    def testGetCalendar(self):
+        # Create calendar
+        c = self.principal.make_calendar(name="Yep", cal_id=self.testcal_id)
+        assert_not_equal(c.url, None)
         assert_not_equal(len(self.principal.calendars()), 0)
 
     def testProxy(self):
-        if self.caldav.url.scheme == 'https':
+        if self.caldav.url.scheme == 'https' or 'noproxy' in self.server_params:
             raise SkipTest("Skipping %s.testProxy as the TinyHTTPProxy "
                            "implementation doesn't support https")
 
@@ -431,7 +432,9 @@ class RepeatedFunctionalTestsBaseClass(object):
         # c.todos() should give a full list of todo items
         logging.info("Fetching the full list of todo items (should be one)")
         todos = c.todos()
+        todos2 = c.todos(include_completed=True)
         assert_equal(len(todos), 1)
+        assert_equal(len(todos2), 1)
 
         logging.info("Fetching the events (should be none)")
         # c.events() should NOT return todo-items
@@ -494,7 +497,8 @@ class RepeatedFunctionalTestsBaseClass(object):
         assert_equal(len(todos), 4)
 
         notodos = c.date_search(  # default compfilter is events
-            start=datetime(1997, 4, 14), end=datetime(2015, 5, 14))
+            start=datetime(1997, 4, 14), end=datetime(2015, 5, 14),
+            expand=False)
         assert(not notodos)
 
         # Now, this is interesting.  2 events have dtstart set, 3 has
@@ -502,7 +506,7 @@ class RepeatedFunctionalTestsBaseClass(object):
         # duration set.  What will a date search yield?
         todos = c.date_search(
             start=datetime(1997, 4, 14), end=datetime(2015, 5, 14),
-            compfilter='VTODO')
+            compfilter='VTODO', expand=False)
         # The RFCs are pretty clear on this.  rfc5545 states:
 
         # A "VTODO" calendar component without the "DTSTART" and "DUE" (or
@@ -611,17 +615,25 @@ class RepeatedFunctionalTestsBaseClass(object):
         if 'zimbra' in str(c.url):
             assert_raises(Exception, self.principal.make_calendar,
                           "Yep", self.testcal_id2)
+        else:
+            # This may fail, and if it fails, add an exception to the test
+            # (see the "if" above)
+            cc = self.principal.make_calendar("Yep", self.testcal_id2)
+            cc.delete()
 
         c.set_properties([dav.DisplayName("hooray"), ])
         props = c.get_properties([dav.DisplayName(), ])
         assert_equal(props[dav.DisplayName.tag], "hooray")
 
-        # Creating a new calendar with different ID and old name
-        # - should never fail
-        cc = self.principal.make_calendar(
-            name="Yep", cal_id=self.testcal_id2).save()
-        assert_not_equal(cc.url, None)
-        cc.delete()
+        # Creating a new calendar with different ID and old name, this should
+        # work, shouldn't it?
+        # ... ouch, now it fails with a 409 on zimbra (it didn't fail
+        # earlier)
+        if not 'zimbra' in str(c.url):
+            cc = self.principal.make_calendar(
+                name="Yep", cal_id=self.testcal_id2).save()
+            assert_not_equal(cc.url, None)
+            cc.delete()
 
     def testLookupEvent(self):
         """
@@ -686,7 +698,7 @@ class RepeatedFunctionalTestsBaseClass(object):
 
         # .. and search for it.
         r = c.date_search(datetime(2006, 7, 13, 17, 00, 00),
-                          datetime(2006, 7, 15, 17, 00, 00))
+                          datetime(2006, 7, 15, 17, 00, 00), expand=False)
 
         assert_equal(e.instance.vevent.uid, r[0].instance.vevent.uid)
         assert_equal(len(r), 1)
@@ -696,22 +708,20 @@ class RepeatedFunctionalTestsBaseClass(object):
         e.data = ev2
         e.save()
         r = c.date_search(datetime(2006, 7, 13, 17, 00, 00),
-                          datetime(2006, 7, 15, 17, 00, 00))
+                          datetime(2006, 7, 15, 17, 00, 00), expand=False)
         assert_equal(len(r), 0)
 
         r = c.date_search(datetime(2007, 7, 13, 17, 00, 00),
-                          datetime(2007, 7, 15, 17, 00, 00))
+                          datetime(2007, 7, 15, 17, 00, 00), expand=False)
         assert_equal(len(r), 1)
 
         # date search without closing date should also find it
-        r = c.date_search(datetime(2007, 7, 13, 17, 00, 00))
+        r = c.date_search(datetime(2007, 7, 13, 17, 00, 00), expand=False)
         assert_equal(len(r), 1)
 
         # Lets try a freebusy request as well
-        # except for on my own DAViCal, it returns 500 Internal Server Error
-        # for me.  Should look more into that.  TODO.
-        if 'calendar.bekkenstenveien53c.oslo' in str(self.caldav.url):
-            raise SkipTest("TEMP/TODO/KLUDGE - skipping this test as for now")
+        if 'nofreebusy' in self.server_params:
+            raise SkipTest("FreeBusy test skipped - not supported by server?")
         freebusy = c.freebusy_request(datetime(2007, 7, 13, 17, 00, 00),
                                       datetime(2007, 7, 15, 17, 00, 00))
         # TODO: assert something more complex on the return object
@@ -732,11 +742,11 @@ class RepeatedFunctionalTestsBaseClass(object):
         # evr is a yearly event starting at 1997-02-11
         e = c.add_event(evr)
         r = c.date_search(datetime(2008, 11, 1, 17, 00, 00),
-                          datetime(2008, 11, 3, 17, 00, 00))
+                          datetime(2008, 11, 3, 17, 00, 00), expand=True)
         assert_equal(len(r), 1)
         assert_equal(r[0].data.count("END:VEVENT"), 1)
         r = c.date_search(datetime(2008, 11, 1, 17, 00, 00),
-                          datetime(2009, 11, 3, 17, 00, 00))
+                          datetime(2009, 11, 3, 17, 00, 00), expand=True)
         assert_equal(len(r), 1)
 
         # So much for standards ... seems like different servers
@@ -783,7 +793,7 @@ class RepeatedFunctionalTestsBaseClass(object):
         assert_equal(e.instance.vevent.uid, ee.instance.vevent.uid)
 
         r = c.date_search(datetime(2006, 7, 13, 17, 00, 00),
-                          datetime(2006, 7, 15, 17, 00, 00))
+                          datetime(2006, 7, 15, 17, 00, 00), expand=False)
         assert_equal(e.instance.vevent.uid, r[0].instance.vevent.uid)
         assert_equal(len(r), 1)
 
@@ -797,21 +807,21 @@ class RepeatedFunctionalTestsBaseClass(object):
         assert_equal(e2.instance.vevent.uid, tmp.instance.vevent.uid)
 
         r = c.date_search(datetime(2007, 7, 13, 17, 00, 00),
-                          datetime(2007, 7, 15, 17, 00, 00))
+                          datetime(2007, 7, 15, 17, 00, 00), expand=False)
         assert_equal(len(r), 1)
 
         e.data = ev2
         e.save()
 
         r = c.date_search(datetime(2007, 7, 13, 17, 00, 00),
-                          datetime(2007, 7, 15, 17, 00, 00))
+                          datetime(2007, 7, 15, 17, 00, 00), expand=False)
         # for e in r: print(e.data)
         assert_equal(len(r), 1)
 
         e.instance = e2.instance
         e.save()
         r = c.date_search(datetime(2007, 7, 13, 17, 00, 00),
-                          datetime(2007, 7, 15, 17, 00, 00))
+                          datetime(2007, 7, 15, 17, 00, 00), expand=False)
         # for e in r: print(e.data)
         assert_equal(len(r), 1)
 

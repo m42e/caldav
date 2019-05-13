@@ -10,6 +10,7 @@ import vobject
 import uuid
 import re
 import datetime
+import tzlocal
 from lxml import etree
 
 try:
@@ -27,8 +28,28 @@ def errmsg(r):
     """Utility for formatting a response xml tree to an error string"""
     return "%s %s\n\n%s" % (r.status, r.reason, r.raw)
 
+def _fix_tz(dt):
+    """
+    This method takes a datetime or a date and returns the same.
+
+    * if the dt object is a date, return it.
+    * if the dt object is a datetime with tzinfo, return it.
+    * if the dt object is a datetime without tzinfo, assume it's in localtime,
+      set it as such and return.
+
+    This method is used when searching the calendar with a date range;
+    datetime objects will later be converted to UTC in elements.cdav
+
+    See also https://github.com/python-caldav/caldav/commit/7878d65fa4553cf91dde26334e5794c0852613b5#commitcomment-33417016 for more details
+    """
+    if dt is None:
+        return None
+    if hasattr(dt, 'tzname') and dt.tzname() is None:
+            return dt.replace(tzinfo=tzlocal.get_localzone())
+    return dt
 
 class DAVObject(object):
+
     """
     Base class for all DAV objects.  Can be instantiated by a client
     and an absolute or relative URL, or from the parent object.
@@ -166,11 +187,12 @@ class DAVObject(object):
         # All items should be in a <D:response> element
         for r in response.tree.findall('.//' + dav.Response.tag):
             status = r.find('.//' + dav.Status.tag)
-            if (' 200 ' not in status.text and
-                ' 207 ' not in status.text and
-                ' 404 ' not in status.text):
-                raise error.ReportError(errmsg(response))
-                # TODO: may be wrong error class
+            if status != None:
+                if (' 200 ' not in status.text and
+                    ' 207 ' not in status.text and
+                    ' 404 ' not in status.text):
+                    raise error.ReportError(errmsg(response))
+                    # TODO: may be wrong error class
             href = unquote(r.find('.//' + dav.Href.tag).text)
             properties[href] = {}
             for p in props:
@@ -207,7 +229,10 @@ class DAVObject(object):
         response = self._query_properties(props, depth)
         properties = self._handle_prop_response(response, props)
         path = unquote(self.url.path)
-        exchange_path = path + '/'
+        if path.endswith('/'):
+            exchange_path = path[:-1]
+        else:
+            exchange_path = path + '/'
 
         if path in properties:
             rc = properties[path]
@@ -387,11 +412,12 @@ class Principal(DAVObject):
             self._calendar_home_set = url
             return
         sanitized_url = URL.objectify(url)
-        if (sanitized_url.hostname and
-            sanitized_url.hostname != self.client.url.hostname):
-            # icloud (and others?) having a load balanced system,
-            # where each principal resides on one named host
-            self.client.url = sanitized_url
+        if sanitized_url != None:
+            if (sanitized_url.hostname and
+                sanitized_url.hostname != self.client.url.hostname):
+                # icloud (and others?) having a load balanced system,
+                # where each principal resides on one named host
+                self.client.url = sanitized_url
         self._calendar_home_set = CalendarSet(
             self.client, self.client.url.join(sanitized_url))
 
@@ -524,7 +550,7 @@ class Calendar(DAVObject):
                 self.url = URL.objectify(str(self.url) + '/')
         return self
 
-    def date_search(self, start, end=None, compfilter="VEVENT"):
+    def date_search(self, start, end=None, compfilter="VEVENT", expand="maybe"):
         """
         Search events by date in the calendar. Recurring events are
         expanded if they are occuring during the specified time frame
@@ -535,6 +561,9 @@ class Calendar(DAVObject):
          * end = same as above.
          * compfilter = defaults to events only.  Set to None to fetch all
            calendar components.
+         * expand - should recurrent events be expanded?  (to preserve 
+           backward-compatibility the default "maybe" will be changed into True 
+           unless the date_search is open-ended)
 
         Returns:
          * [CalendarObjectResource(), ...]
@@ -544,12 +573,23 @@ class Calendar(DAVObject):
 
         # build the request
 
+        # fix missing tzinfo in the start and end datetimes
+        start = _fix_tz(start)
+        end = _fix_tz(end)
+
+        ## for backward compatibility - expand should be false
+        ## in an open-ended date search, otherwise true
+        if expand == 'maybe':
+            expand = end
+
         # Some servers will raise an error if we send the expand flag
         # but don't set any end-date - expand doesn't make much sense
         # if we have one recurring event describing an indefinite
-        # series of events.  Hence, if the end date is not set, we
-        # skip asking for expanded events.
-        if end:
+        # series of events.  I think it's appropriate to raise an error
+        # in this case.
+        if not end and expand:
+            raise error.ReportError("an open-ended date search cannot be expanded")
+        elif expand:
             data = cdav.CalendarData() + cdav.Expand(start, end)
         else:
             data = cdav.CalendarData()
@@ -584,9 +624,35 @@ class Calendar(DAVObject):
          * [FreeBusy(), ...]
 
         """
+        # fix missing tzinfo in the start and end datetimes
+        start = _fix_tz(start)
+        end = _fix_tz(end)
+
         root = cdav.FreeBusyQuery() + [cdav.TimeRange(start, end)]
         response = self._query(root, 1, 'report')
         return FreeBusy(self, response.raw)
+
+    def _fetch_todos(self, filters):
+        # ref https://www.ietf.org/rfc/rfc4791.txt, section 7.8.9
+        matches = []
+
+        # build the request
+        data = cdav.CalendarData()
+        prop = dav.Prop() + data
+
+        vcalendar = cdav.CompFilter("VCALENDAR") + filters
+        filter = cdav.Filter() + vcalendar
+
+        root = cdav.CalendarQuery() + [prop, filter]
+
+        response = self._query(root, 1, 'report')
+        results = self._handle_prop_response(
+            response=response, props=[cdav.CalendarData()])
+        for r in results:
+            matches.append(
+                Todo(self.client, url=self.url.join(r),
+                     data=results[r][cdav.CalendarData.tag], parent=self))
+        return matches
 
     def todos(self, sort_keys=('due', 'priority'), include_completed=False,
               sort_key=None):
@@ -600,38 +666,49 @@ class Calendar(DAVObject):
            by default, only pending tasks are listed
          * sort_key: DEPRECATED, for backwards compatibility with version 0.4.
         """
-        # ref https://www.ietf.org/rfc/rfc4791.txt, section 7.8.9
-        matches = []
-
-        # build the request
-        data = cdav.CalendarData()
-        prop = dav.Prop() + data
-
         if sort_key:
             sort_keys = (sort_key,)
 
         if not include_completed:
             vnotcompleted = cdav.TextMatch('COMPLETED', negate=True)
             vnotcancelled = cdav.TextMatch('CANCELLED', negate=True)
-            vstatusNotCompleted = cdav.PropFilter('STATUS') + vnotcompleted + cdav.NotDefined()
-            vstatusNotCancelled = cdav.PropFilter('STATUS') + vnotcancelled + cdav.NotDefined()
+            vstatusNotCompleted = cdav.PropFilter('STATUS') + vnotcompleted
+            vstatusNotCancelled = cdav.PropFilter('STATUS') + vnotcancelled
+            vstatusNotDefined = cdav.PropFilter('STATUS') + cdav.NotDefined()
             vnocompletedate = cdav.PropFilter('COMPLETED') + cdav.NotDefined()
-            vtodo = (cdav.CompFilter("VTODO") + vnocompletedate +
-                     vstatusNotCompleted + vstatusNotCancelled)
+            filters1 = (cdav.CompFilter("VTODO") + vnocompletedate +
+                        vstatusNotCompleted + vstatusNotCancelled)
+            ## This query is quite much in line with https://tools.ietf.org/html/rfc4791#section-7.8.9
+            matches1 = self._fetch_todos(filters1)
+            ## However ... some server implementations (i.e. NextCloud
+            ## and Baikal) will yield "false" on a negated TextMatch
+            ## if the field is not defined.  Hence, for those
+            ## implementations we need to turn back and ask again
+            ## ... do you have any VTODOs for us where the STATUS
+            ## field is not defined? (ref
+            ## https://github.com/python-caldav/caldav/issues/14)
+            filters2 = (cdav.CompFilter("VTODO") + vnocompletedate +
+                        vstatusNotDefined)
+            matches2 = self._fetch_todos(filters2)
+
+            ## For most caldav servers, everything in matches2 already exists
+            ## in matches1.  We need to make a union ...
+            match_set = set()
+            matches = []
+            for todo in matches1 + matches2:
+                if not str(todo.url) in match_set:
+                    match_set.add(str(todo.url))
+                    ## and still, Zimbra seems to deliver too many TODOs on the
+                    ## filter2 ... let's do some post-filtering in case the
+                    ## server fails in filtering things the right way
+                    if (not '\nCOMPLETED:' in todo.data and
+                        not '\nSTATUS:COMPLETED' in todo.data and
+                        not '\nSTATUS:CANCELLED' in todo.data):
+                        matches.append(todo)
+
         else:
-            vtodo = cdav.CompFilter("VTODO")
-        vcalendar = cdav.CompFilter("VCALENDAR") + vtodo
-        filter = cdav.Filter() + vcalendar
-
-        root = cdav.CalendarQuery() + [prop, filter]
-
-        response = self._query(root, 1, 'report')
-        results = self._handle_prop_response(
-            response=response, props=[cdav.CalendarData()])
-        for r in results:
-            matches.append(
-                Todo(self.client, url=self.url.join(r),
-                     data=results[r][cdav.CalendarData.tag], parent=self))
+            filters = cdav.CompFilter("VTODO")
+            matches = self._fetch_todos(filters)
 
         def sort_key_func(x):
             ret = []
@@ -642,6 +719,12 @@ class Calendar(DAVObject):
                 'priority': '0',
                 # JA: why compare datetime.strftime('%F%H%M%S')
                 # JA: and not simply datetime?
+
+                # tobixen: probably it was made like this because we can get
+                # both dates and timestamps from the objects.
+                # Python will yield an exception if trying to compare
+                # a timestamp with a date.
+
                 'isnt_overdue':
                     not (hasattr(vtodo, 'due') and
                          vtodo.due.value.strftime('%F%H%M%S') <
@@ -719,10 +802,12 @@ class Calendar(DAVObject):
             # Ref Lucas Verney, we've actually done a substring search, if the
             # uid given in the query is short (i.e. just "0") we're likely to
             # get false positives back from the server.
-            if not "\nUID:%s\n" % uid in data:
-                # TODO: optimistic assumption, uid line is not folded.  We
-                # need to unfold the content to be 100% sure that we won't
-                # filter away true positives here.
+            #
+            # Long uids are folded, so splice the lines together here before
+            # attempting a match.
+            item_uid = re.search(r'\nUID:((.|\n[ \t])*)\n', data)
+            if (not item_uid or
+                    re.sub(r'\n[ \t]', '', item_uid.group(1)) != uid):
                 continue
             return self._calendar_comp_class_by_data(data)(
                 self.client, url=URL.objectify(href), data=data, parent=self)
@@ -795,9 +880,9 @@ class Calendar(DAVObject):
 class CalendarObjectResource(DAVObject):
     """
     Ref RFC 4791, section 4.1, a "Calendar Object Resource" can be an
-    event, a todo-item, a journal entry, a free/busy entry, etc.
+    event, a todo-item, a journal entry, or a free/busy entry
     """
-    _instance = None
+    _vobject_instance = None
     _data = None
 
     def __init__(self, client=None, url=None, data=None, parent=None, id=None):
@@ -835,20 +920,20 @@ class CalendarObjectResource(DAVObject):
         elif id is None:
             for obj_type in ('vevent', 'vtodo', 'vjournal', 'vfreebusy'):
                 obj = None
-                if hasattr(self.instance, obj_type):
-                    obj = getattr(self.instance, obj_type)
-                elif self.instance.name.lower() == obj_type:
-                    obj = self.instance
+                if hasattr(self.vobject_instance, obj_type):
+                    obj = getattr(self.vobject_instance, obj_type)
+                elif self.vobject_instance.name.lower() == obj_type:
+                    obj = self.vobject_instance
                 if obj is not None:
                     id = obj.uid.value
                     break
         else:
             for obj_type in ('vevent', 'vtodo', 'vjournal', 'vfreebusy'):
                 obj = None
-                if hasattr(self.instance, obj_type):
-                    obj = getattr(self.instance, obj_type)
-                elif self.instance.name.lower() == obj_type:
-                    obj = self.instance
+                if hasattr(self.vobject_instance, obj_type):
+                    obj = getattr(self.vobject_instance, obj_type)
+                elif self.vobject_instance.name.lower() == obj_type:
+                    obj = self.vobject_instance
                 if obj is not None:
                     if not hasattr(obj, 'uid'):
                         obj.add('uid')
@@ -875,9 +960,22 @@ class CalendarObjectResource(DAVObject):
         Returns:
          * self
         """
-        if self._instance is not None:
-            path = self.url.path if self.url else None
-            self._create(self._instance.serialize(), self.id, path)
+        if self._vobject_instance is None and self._data is None:
+            return self
+        path = self.url.path if self.url else None
+
+        if self._vobject_instance is None:
+            ## ref https://github.com/python-caldav/caldav/issues/43
+            ## we don't want to use vobject unless needed, but
+            ## sometimes the caldav server may balk on slightly
+            ## non-conforming icalendar data.  We'll just throw in a
+            ## try-send-data-except-wash-through-vobject-logic here.
+            try:
+                self._create(self._data, self.id, path)
+            except error.PutError:
+                self._create(self.vobject_instance.serialize(), self.id, path)
+        else:
+            self._create(self._vobject_instance.serialize(), self.id, path)
         return self
 
     def __str__(self):
@@ -885,11 +983,12 @@ class CalendarObjectResource(DAVObject):
 
     def _set_data(self, data):
         if type(data).__module__.startswith("vobject"):
-            self._data = data
-            self._instance = data
+            self._data = self._vobject_instance
+            self._vobject_instance = data
         else:
             self._data = vcal.fix(data)
-            self._instance = vobject.readOne(to_unicode(self._data))
+            self._vobject_instance = None
+            #self._instance = vobject.readOne(to_unicode(self._data))
         return self
 
     def _get_data(self):
@@ -897,15 +996,20 @@ class CalendarObjectResource(DAVObject):
     data = property(_get_data, _set_data,
                     doc="vCal representation of the object")
 
-    def _set_instance(self, inst):
-        self._instance = inst
+    def _set_vobject_instance(self, inst):
+        self._vobject_instance = inst
         self._data = inst.serialize()
         return self
 
-    def _get_instance(self):
-        return self._instance
-    instance = property(_get_instance, _set_instance,
+    def _get_vobject_instance(self):
+        if not self._vobject_instance and self._data:
+            self._vobject_instance = vobject.readOne(to_unicode(self._data))
+        return self._vobject_instance
+
+    vobject_instance = property(_get_vobject_instance, _set_vobject_instance,
                         doc="vobject instance of the object")
+    ## for backward-compatibility
+    instance = vobject_instance
 
 
 class Event(CalendarObjectResource):
@@ -932,7 +1036,7 @@ class FreeBusy(CalendarObjectResource):
         A freebusy response object has no URL or ID (TODO: reconsider the
         class hierarchy?  most of the inheritated methods are moot and
         will fail?).  Raw response can be accessed through self.data,
-        instantiated vobject as self.instance.
+        instantiated vobject as self.vobject_instance.
         """
         CalendarObjectResource.__init__(self, client=parent.client, url=None,
                                         data=data, parent=parent, id=None)
@@ -952,8 +1056,8 @@ class Todo(CalendarObjectResource):
         """
         if not completion_timestamp:
             completion_timestamp = datetime.datetime.now()
-        if not hasattr(self.instance.vtodo, 'status'):
-            self.instance.vtodo.add('status')
-        self.instance.vtodo.status.value = 'COMPLETED'
-        self.instance.vtodo.add('completed').value = completion_timestamp
+        if not hasattr(self.vobject_instance.vtodo, 'status'):
+            self.vobject_instance.vtodo.add('status')
+        self.vobject_instance.vtodo.status.value = 'COMPLETED'
+        self.vobject_instance.vtodo.add('completed').value = completion_timestamp
         self.save()
